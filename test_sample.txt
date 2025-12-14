@@ -1,0 +1,1 @@
+Hello, this is a voice test for the ebook2audiobook application. I'm testing how well the voice cloning works with this sample text. The system should be able to clone the voice from the provided audio sample and use it to speak these words. This is a great way to test voice quality before processing an entire ebook.

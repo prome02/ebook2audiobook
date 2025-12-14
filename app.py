@@ -1,5 +1,9 @@
 print("starting...")
 
+# Disable weights_only for PyTorch 2.7+ compatibility
+import os
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
 import argparse
 
 language_options = [
@@ -79,6 +83,7 @@ parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling. Lower
 parser.add_argument("--top_p", type=float, default=0.8, help="Top-p sampling. Lower values mean more likely outputs and increased audio generation speed. Defaults to 0.8.")
 parser.add_argument("--speed", type=float, default=1.0, help="Speed factor for the speech generation. IE: How fast the Narrerator will speak. Defaults to 1.0.")
 parser.add_argument("--enable_text_splitting", type=bool, default=False, help="Enable splitting text into sentences. Defaults to True.")
+parser.add_argument("--test_text", type=str, help="Path to a .txt file for voice testing. When provided, only converts this text file instead of the full ebook.")
 
 args = parser.parse_args()
 
@@ -88,6 +93,10 @@ import os
 import shutil
 import subprocess
 import re
+# Add custom ffmpeg path to PATH for pydub
+custom_ffmpeg_path = r"C:\Users\prome\Documents\ffmpeg-essentials_build\bin"
+os.environ["PATH"] = os.pathsep.join([custom_ffmpeg_path, os.environ.get("PATH", "")])
+os.environ["FFMPEG_BINARY"] = os.path.join(custom_ffmpeg_path, "ffmpeg.exe")
 from pydub import AudioSegment
 import tempfile
 from pydub import AudioSegment
@@ -95,9 +104,14 @@ import nltk
 from nltk.tokenize import sent_tokenize
 import sys
 import torch
+import torch.serialization
 from TTS.api import TTS
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
+
+# Add safe globals for PyTorch 2.7+ compatibility
+from TTS.tts.models.xtts import XttsAudioConfig
+torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig])
 from tqdm import tqdm
 import gradio as gr
 from gradio import Progress
@@ -588,6 +602,73 @@ from tqdm import tqdm
 
 # Convert chapters to audio using XTTS
 
+def test_voice_with_text(text_file_path, target_voice_path, language, temperature, length_penalty, repetition_penalty, top_k, top_p, speed, enable_text_splitting, use_custom_model=False, custom_model=None, custom_model_url=None):
+    """Test voice cloning with a simple text file"""
+    print(f"Starting voice test with text file: {text_file_path}")
+
+    # Read the text content
+    try:
+        with open(text_file_path, 'r', encoding='utf-8') as f:
+            text_content = f.read().strip()
+        print(f"Read {len(text_content)} characters from text file")
+    except Exception as e:
+        print(f"Error reading text file: {e}")
+        return None
+
+    # Create output directory for test
+    output_dir = "voice_test_output"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Use appropriate conversion function based on model type
+    if use_custom_model:
+        print("Using custom model for voice test...")
+        # Create temporary chapters directory with the text
+        temp_chapters_dir = os.path.join(output_dir, "temp_chapters")
+        os.makedirs(temp_chapters_dir, exist_ok=True)
+
+        # Write text to a chapter file
+        chapter_file = os.path.join(temp_chapters_dir, "test_chapter.txt")
+        with open(chapter_file, 'w', encoding='utf-8') as f:
+            f.write(text_content)
+
+        convert_chapters_to_audio_custom_model(
+            temp_chapters_dir, output_dir, temperature, length_penalty,
+            repetition_penalty, top_k, top_p, speed, enable_text_splitting,
+            target_voice_path, language, custom_model
+        )
+
+        # Clean up temp directory
+        shutil.rmtree(temp_chapters_dir)
+    else:
+        print("Using standard model for voice test...")
+        # Create temporary chapters directory with the text
+        temp_chapters_dir = os.path.join(output_dir, "temp_chapters")
+        os.makedirs(temp_chapters_dir, exist_ok=True)
+
+        # Write text to a chapter file
+        chapter_file = os.path.join(temp_chapters_dir, "test_chapter.txt")
+        with open(chapter_file, 'w', encoding='utf-8') as f:
+            f.write(text_content)
+
+        convert_chapters_to_audio_standard_model(
+            temp_chapters_dir, output_dir, temperature, length_penalty,
+            repetition_penalty, top_k, top_p, speed, enable_text_splitting,
+            target_voice_path, language
+        )
+
+        # Clean up temp directory
+        shutil.rmtree(temp_chapters_dir)
+
+    # Find the generated audio file
+    output_files = [f for f in os.listdir(output_dir) if f.endswith('.wav')]
+    if output_files:
+        output_file = os.path.join(output_dir, output_files[0])
+        print(f"Voice test completed! Output saved to: {output_file}")
+        return output_file
+    else:
+        print("No audio file was generated during voice test")
+        return None
+
 def convert_chapters_to_audio_custom_model(chapters_dir, output_audio_dir, temperature, length_penalty, repetition_penalty, top_k, top_p, speed, enable_text_splitting, target_voice_path=None, language=None, custom_model=None):
 
     if target_voice_path==None:
@@ -640,7 +721,10 @@ def convert_chapters_to_audio_custom_model(chapters_dir, output_audio_dir, tempe
                     fragments = split_long_sentence(sentence, language=language)
                     for fragment in fragments:
                         if fragment != "":
-                            print(f"Generating fragment: {fragment}...")
+                            try:
+                                print(f"Generating fragment: {fragment}...")
+                            except UnicodeEncodeError:
+                                print("Generating fragment... (Chinese text)")
                             fragment_file_path = os.path.join(temp_audio_directory, f"{temp_count}.wav")
                             if custom_model:
                                 # length penalty will not apply for custome models, its just too much of a headache perhaps if someone else can do it for me lol, im just one man :(
@@ -698,7 +782,13 @@ def convert_chapters_to_audio_standard_model(chapters_dir, output_audio_dir, tem
                     fragments = split_long_sentence(sentence, language=language)
                     for fragment in fragments:
                         if fragment != "":
-                            print(f"Generating fragment: {fragment}...")
+                            try:
+                                try:
+                                    print(f"Generating fragment: {fragment}...")
+                                except UnicodeEncodeError:
+                                    print("Generating fragment... (Chinese text)")
+                            except UnicodeEncodeError:
+                                print("Generating fragment... (Chinese text)")
                             fragment_file_path = os.path.join(temp_audio_directory, f"{temp_count}.wav")
                             speaker_wav_path = target_voice_path if target_voice_path else default_target_voice_path
                             tts.tts_to_file(
@@ -724,7 +814,63 @@ def convert_chapters_to_audio_standard_model(chapters_dir, output_audio_dir, tem
 
 
 # Define the functions to be used in the Gradio interface
-def convert_ebook_to_audio(ebook_file, target_voice_file, language, use_custom_model, custom_model_file, custom_config_file, custom_vocab_file, temperature, length_penalty, repetition_penalty, top_k, top_p, speed, enable_text_splitting, custom_model_url=None, progress=gr.Progress()):
+
+def test_txt_to_audio(txt_file, target_voice_file, language, temperature, speed, progress=None):
+    """
+    Simple test function to convert a .txt file to audio using TTS
+    """
+    # Ensure progress is callable; provide a no‑op if None
+    if progress is None:
+        def _dummy_progress(*_args, **_kwargs):
+            pass
+        progress = _dummy_progress
+    try:
+        progress(0, desc="Initializing TTS model...")
+
+        # Initialize TTS model
+        selected_tts_model = "tts_models/multilingual/multi-dataset/xtts_v2"
+        tts = TTS(selected_tts_model, progress_bar=False).to(device)
+
+        progress(0.2, desc="Reading text file...")
+
+        # Read the text file
+        with open(txt_file.name, 'r', encoding='utf-8') as file:
+            text_content = file.read().strip()
+
+        # Limit text length for testing (first 500 characters)
+        if len(text_content) > 500:
+            text_content = text_content[:500] + "..."
+
+        progress(0.4, desc="Preparing voice generation...")
+
+        # Set up output directory
+        output_dir = os.path.join(".", "Working_files", "test_output")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Set up voice file path
+        speaker_wav_path = target_voice_file.name if target_voice_file else default_target_voice_path
+
+        progress(0.6, desc="Generating voice...")
+
+        # Generate audio
+        output_file_path = os.path.join(output_dir, "test_output.wav")
+        tts.tts_to_file(
+            text=text_content,
+            file_path=output_file_path,
+            speaker_wav=speaker_wav_path,
+            language=language,
+            temperature=temperature,
+            speed=speed
+        )
+
+        progress(1.0, desc="Complete!")
+
+        return output_file_path, f"Successfully generated audio! Text length: {len(text_content)} characters"
+
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
+def convert_ebook_to_audio(ebook_file, target_voice_file, language, use_custom_model, custom_model_file, custom_config_file, custom_vocab_file, temperature, length_penalty, repetition_penalty, top_k, top_p, speed, enable_text_splitting, custom_model_url=None):
 
     ebook_file_path = args.ebook if args.ebook else ebook_file.name
     target_voice = args.voice if args.voice else target_voice_file.name if target_voice_file else None
@@ -742,7 +888,9 @@ def convert_ebook_to_audio(ebook_file, target_voice_file, language, use_custom_m
     if args.headless and args.language:
         language = args.language
     else:
-        language = language  # Gradio dropdown value
+        # Fallback to a default language if none was provided (e.g., when UI does not set it)
+        if language is None:
+            language = "en"
 
     # If headless is used with the custom model arguments
     if args.use_custom_model and args.custom_model and args.custom_config and args.custom_vocab:
@@ -773,37 +921,25 @@ def convert_ebook_to_audio(ebook_file, target_voice_file, language, use_custom_m
             'vocab': os.path.join(download_dir, 'vocab.json_')
         }
     
-    try:
-        progress(0, desc="Starting conversion")
-    except Exception as e:
-        print(f"Error updating progress: {e}")
+    print("Starting conversion")
     
     if not calibre_installed():
         return "Calibre is not installed."
     
     
-    try:
-        progress(0.1, desc="Creating chapter-labeled book")
-    except Exception as e:
-        print(f"Error updating progress: {e}")
+    print("Creating chapter‑labeled book")
     
     create_chapter_labeled_book(ebook_file_path)
     audiobook_output_path = os.path.join(".", "Audiobooks")
     
-    try:
-        progress(0.3, desc="Converting chapters to audio")
-    except Exception as e:
-        print(f"Error updating progress: {e}")
+    print("Converting chapters to audio")
     
     if use_custom_model:
         convert_chapters_to_audio_custom_model(chapters_directory, output_audio_directory, temperature, length_penalty, repetition_penalty, top_k, top_p, speed, enable_text_splitting, target_voice, language, custom_model)
     else:
         convert_chapters_to_audio_standard_model(chapters_directory, output_audio_directory, temperature, length_penalty, repetition_penalty, top_k, top_p, speed, enable_text_splitting, target_voice, language)
     
-    try:
-        progress(0.9, desc="Creating M4B from chapters")
-    except Exception as e:
-        print(f"Error updating progress: {e}")
+    print("Creating M4B from chapters")
     
     create_m4b_from_chapters(output_audio_directory, ebook_file_path, audiobook_output_path)
     
@@ -811,10 +947,7 @@ def convert_ebook_to_audio(ebook_file, target_voice_file, language, use_custom_m
     m4b_filename = os.path.splitext(os.path.basename(ebook_file_path))[0] + '.m4b'
     m4b_filepath = os.path.join(audiobook_output_path, m4b_filename)
 
-    try:
-        progress(1.0, desc="Conversion complete")
-    except Exception as e:
-        print(f"Error updating progress: {e}")
+    print("Conversion complete")
     print(f"Audiobook created at {m4b_filepath}")
     return f"Audiobook created at {m4b_filepath}", m4b_filepath
 
@@ -846,17 +979,6 @@ def run_gradio_interface():
     )
 
 # Gradio UI setup
-def run_gradio_interface():
-    language_options = [
-        "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko"
-    ]
-
-    theme = gr.themes.Soft(
-        primary_hue="blue",
-        secondary_hue="blue",
-        neutral_hue="blue",
-        text_size=gr.themes.sizes.text_md,
-    )
 
     with gr.Blocks(theme=theme) as demo:
         gr.Markdown(
@@ -941,10 +1063,46 @@ def run_gradio_interface():
                     info="Adjusts How fast the narrator will speak."
                 )
                 enable_text_splitting = gr.Checkbox(
-                    label="Enable Text Splitting", 
+                    label="Enable Text Splitting",
                     value=False,
                     info="Splits long texts into sentences to generate audio in chunks. Useful for very long inputs."
                 )
+
+            with gr.TabItem("TXT 測試"):  # New tab for TXT testing
+                gr.Markdown(
+                """
+                ### 簡單 TXT 文件測試
+
+                上傳一個 .txt 文件進行快速的 TTS 測試（僅轉換前 500 個字符）
+                """
+                )
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        test_txt_file = gr.File(label="TXT 文件", file_types=[".txt"])
+                        test_voice_file = gr.File(label="語音文件 (可選)", file_types=[".wav", ".mp3"])
+                        test_language = gr.Dropdown(label="語言", choices=language_options, value="en")
+
+                    with gr.Column(scale=2):
+                        test_temperature = gr.Slider(
+                            label="Temperature",
+                            minimum=0.1,
+                            maximum=2.0,
+                            step=0.1,
+                            value=0.65,
+                            info="控制輸出的創造性"
+                        )
+                        test_speed = gr.Slider(
+                            label="語速",
+                            minimum=0.5,
+                            maximum=2.0,
+                            step=0.1,
+                            value=1.0,
+                            info="調整講話速度"
+                        )
+
+                test_btn = gr.Button("開始測試", variant="primary")
+                test_output = gr.Textbox(label="測試狀態")
+                test_audio_player = gr.Audio(label="測試音頻", type="filepath")
 
         convert_btn = gr.Button("Convert to Audiobook", variant="primary")
         output = gr.Textbox(label="Conversion Status")
@@ -954,21 +1112,28 @@ def run_gradio_interface():
 
         convert_btn.click(
             lambda *args: convert_ebook_to_audio(
-                *args[:7], 
-                float(args[7]),  # Ensure temperature is float
-                float(args[8]),  # Ensure length_penalty is float
-                float(args[9]),  # Ensure repetition_penalty is float
-                int(args[10]),   # Ensure top_k is int
-                float(args[11]), # Ensure top_p is float
-                float(args[12]), # Ensure speed is float
-                *args[13:]
+                *args[:7],
+                float(args[7]),   # temperature
+                float(args[8]),   # length_penalty
+                float(args[9]),   # repetition_penalty
+                int(args[10]),    # top_k
+                float(args[11]),  # top_p
+                float(args[12]),  # speed
+                *args[13:]        # enable_text_splitting, custom_model_url
             ),
             inputs=[
-                ebook_file, target_voice_file, language, use_custom_model, custom_model_file, custom_config_file, 
-                custom_vocab_file, temperature, length_penalty, repetition_penalty, 
+                ebook_file, target_voice_file, language, use_custom_model, custom_model_file, custom_config_file,
+                custom_vocab_file, temperature, length_penalty, repetition_penalty,
                 top_k, top_p, speed, enable_text_splitting, custom_model_url
             ],
             outputs=[output, audio_player]
+        )
+
+        # Test button event handler
+        test_btn.click(
+            test_txt_to_audio,
+            inputs=[test_txt_file, test_voice_file, test_language, test_temperature, test_speed],
+            outputs=[test_audio_player, test_output]
         )
 
 
@@ -992,7 +1157,7 @@ def run_gradio_interface():
     print(f"Running on local URL: http://localhost:7860")
 
     # Launch Gradio app
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=args.share)
+    demo.launch(server_name="0.0.0.0", server_port=7870, share=args.share)
 
 
 
@@ -1002,7 +1167,46 @@ def run_gradio_interface():
 if args.headless:
     # If the arg.custom_model_url exists then use it as the custom_model_url lol
     custom_model_url = args.custom_model_url if args.custom_model_url else None
-    
+
+    # Check if this is a text test mode
+    if args.test_text:
+        print("Running in voice test mode with text file...")
+        if not args.test_text.endswith('.txt'):
+            print("Error: --test_text must point to a .txt file.")
+            exit(1)
+
+        target_voice = args.voice if args.voice else None
+        if not target_voice:
+            print("Error: Voice testing requires a --voice file for cloning.")
+            exit(1)
+
+        custom_model = None
+        if args.use_custom_model:
+            if args.custom_model_url:
+                custom_model_url = args.custom_model_url
+            elif args.custom_model and args.custom_config and args.custom_vocab:
+                custom_model = {
+                    'model': args.custom_model,
+                    'config': args.custom_config,
+                    'vocab': args.custom_vocab
+                }
+            else:
+                print("Error: For custom model testing, provide either --custom_model_url or all model files.")
+                exit(1)
+
+        # Run voice test
+        result = test_voice_with_text(
+            args.test_text, target_voice, args.language, args.temperature,
+            args.length_penalty, args.repetition_penalty, args.top_k, args.top_p,
+            args.speed, args.enable_text_splitting, args.use_custom_model, custom_model, custom_model_url
+        )
+
+        if result:
+            print(f"Voice test completed successfully! Audio saved to: {result}")
+        else:
+            print("Voice test failed.")
+        exit(0)
+
     if not args.ebook:
         print("Error: In headless mode, you must specify an ebook file using --ebook.")
         exit(1)
